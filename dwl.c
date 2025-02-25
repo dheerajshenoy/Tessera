@@ -197,6 +197,7 @@ struct Monitor {
     struct wlr_box w; /* window area, layout-relative */
     struct wl_list layers[4]; /* LayerSurface.link */
     const Layout *lt[2];
+    int gaps;
     unsigned int seltags;
     unsigned int sellt;
     uint32_t tagset[2];
@@ -338,6 +339,7 @@ static void tagmon(const Arg *arg);
 static void tile(Monitor *m);
 static void togglefloating(const Arg *arg);
 static void togglefullscreen(const Arg *arg);
+static void togglegaps(const Arg *arg);
 static void toggletag(const Arg *arg);
 static void toggleview(const Arg *arg);
 static void unlocksession(struct wl_listener *listener, void *data);
@@ -353,6 +355,8 @@ static Monitor *xytomon(double x, double y);
 static void xytonode(double x, double y, struct wlr_surface **psurface,
                      Client **pc, LayerSurface **pl, double *nx, double *ny);
 static void zoom(const Arg *arg);
+static void movestack(const Arg *arg);
+static void cursortomon(Monitor *monitor);
 
 /* variables */
 static const char broken[] = "broken";
@@ -990,6 +994,7 @@ createmon(struct wl_listener *listener, void *data)
 
     wlr_output_state_init(&state);
     /* Initialize monitor state using configured rules */
+    m->gaps = gaps;
     m->tagset[0] = m->tagset[1] = 1;
     for (r = monrules; r < END(monrules); r++) {
         if (!r->name || strstr(wlr_output->name, r->name)) {
@@ -1419,7 +1424,9 @@ focusmon(const Arg *arg)
             selmon = dirtomon(arg->i);
         while (!selmon->wlr_output->enabled && i++ < nmons);
     }
+
     focusclient(focustop(selmon), 1);
+    cursortomon(selmon);
 }
 
 void
@@ -2690,32 +2697,49 @@ tagmon(const Arg *arg)
 void
 tile(Monitor *m)
 {
-    unsigned int mw, my, ty;
+    unsigned int mw, my, ty, h, r, g = m->gaps;
     int i, n = 0;
     Client *c;
 
     wl_list_for_each(c, &clients, link)
     if (VISIBLEON(c, m) && !c->isfloating && !c->isfullscreen)
         n++;
+
     if (n == 0)
         return;
 
+    if (n == smartgaps)
+        g = 0;
+
     if (n > m->nmaster)
-        mw = m->nmaster ? (int)roundf(m->w.width * m->mfact) : 0;
+        mw = m->nmaster ? (int)roundf((m->w.width + g * gappx)* m->mfact) : 0;
     else
         mw = m->w.width;
-    i = my = ty = 0;
+    i = 0;
+    my = ty = g * gappx;
     wl_list_for_each(c, &clients, link) {
         if (!VISIBLEON(c, m) || c->isfloating || c->isfullscreen)
             continue;
         if (i < m->nmaster) {
-            resize(c, (struct wlr_box){.x = m->w.x, .y = m->w.y + my, .width = mw,
-                                       .height = (m->w.height - my) / (MIN(n, m->nmaster) - i)}, 0);
-            my += c->geom.height;
+            r = MIN(n, m->nmaster) - i;
+            h = (m->w.height - my - g * gappx - g * gappx * (r - 1)) / r;
+            resize(c, (struct wlr_box) {
+                .x = m->w.x + g * gappx,
+                .y = m->w.y + my,
+                .width = mw - 2 * g * gappx,
+                .height = h
+            }, 0);
+            my += c->geom.height + g * gappx;
         } else {
-            resize(c, (struct wlr_box){.x = m->w.x + mw, .y = m->w.y + ty,
-                                       .width = m->w.width - mw, .height = (m->w.height - ty) / (n - i)}, 0);
-            ty += c->geom.height;
+            r = n - i;
+            h = (m->w.height - ty - g * gappx - g * gappx* (r - 1)) / r;
+            resize(c, (struct wlr_box){
+                .x = m->w.x + mw,
+                .y = m->w.y + ty,
+                .width = m->w.width - mw - g * gappx,
+                .height = h
+            }, 0);
+            ty += c->geom.height + g * gappx;
         }
         i++;
     }
@@ -3211,4 +3235,62 @@ main(int argc, char *argv[])
 
  usage:
     die("Usage: %s [-v] [-d] [-s startup command]", argv[0]);
+}
+
+void togglegaps(const Arg *arg) {
+    selmon->gaps = !selmon->gaps;
+    arrange(selmon);
+}
+
+void
+movestack(const Arg *arg)
+{
+    Client *c, *sel = focustop(selmon);
+
+    if (!sel) {
+        return;
+    }
+
+    if (wl_list_length(&clients) <= 1) {
+        return;
+    }
+
+    if (arg->i > 0) {
+        wl_list_for_each(c, &sel->link, link) {
+            if (&c->link == &clients) {
+                c = wl_container_of(&clients, c, link);
+                break; /* wrap past the sentinel node */
+            }
+            if (VISIBLEON(c, selmon) || &c->link == &clients) {
+                break; /* found it */
+            }
+        }
+    } else {
+        wl_list_for_each_reverse(c, &sel->link, link) {
+            if (&c->link == &clients) {
+                c = wl_container_of(&clients, c, link);
+                break; /* wrap past the sentinel node */
+            }
+            if (VISIBLEON(c, selmon) || &c->link == &clients) {
+                break; /* found it */
+            }
+        }
+        /* backup one client */
+        c = wl_container_of(c->link.prev, c, link);
+    }
+
+    wl_list_remove(&sel->link);
+    wl_list_insert(&c->link, &sel->link);
+    arrange(selmon);
+}
+
+
+void
+cursortomon(Monitor *mon) {
+    int width, height;
+
+    width = mon->w.x +  mon->w.width / 2;
+    height = mon->w.y + mon->w.height / 2;
+
+    wlr_cursor_warp(cursor, NULL, width, height);
 }
