@@ -1,0 +1,1 @@
+- [X] Fullscreen rule
